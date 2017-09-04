@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"image"
 	"image/jpeg"
 	"io"
@@ -22,8 +22,8 @@ import (
 )
 
 type response struct {
-	Ok  bool   `json:"ok,omitempty"`
-	Err string `json:"err,omitempty"`
+	OK  bool   `json:"ok"`
+	Err string `json:"err"`
 }
 
 var (
@@ -57,45 +57,67 @@ func main() {
 
 func thumbnail(ctx *fasthttp.RequestCtx) {
 	if !ctx.QueryArgs().Has("key") {
-
+		handleError(ctx, errors.New("No argument \"key\" provided"))
+		return
 	}
 	key := ctx.QueryArgs().Peek("key")
-	file, _ := os.Create(string(key))
+	file, err := os.Create(string(key))
+	if err != nil {
+		handleError(ctx, err)
+		return
+	}
 	defer os.Remove(string(key))
 
 	downloaded := make(chan bool)
 	b := make(chan io.Reader)
 
-	go awsDownload(file, string(key), downloaded)
+	go awsDownload(file, string(key), downloaded, ctx)
 
 	<-downloaded
 
-	go resizeImage(file, b)
+	go resizeImage(file, b, ctx)
 
 	buffer := <-b
 
-	uploader.Upload(&s3manager.UploadInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String("thumb/" + string(key)),
-		Body:   buffer,
+	_, err = uploader.Upload(&s3manager.UploadInput{
+		Bucket:      aws.String(bucket),
+		Key:         aws.String("thumb/" + string(key)),
+		Body:        buffer,
+		ContentType: aws.String("image/jpeg"),
 	})
+	if err != nil {
+		handleError(ctx, err)
+	}
+
+	res := response{true, ""}
+	ctx.SetContentType("application/json")
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	jsonErr := json.NewEncoder(ctx).Encode(res)
+	if jsonErr != nil {
+		log.Fatal("Couldn't marshal json ", jsonErr)
+	}
+
 }
 
-func awsDownload(buffer io.WriterAt, key string, c chan bool) {
-	downloader.Download(buffer, &s3.GetObjectInput{
+func awsDownload(buffer io.WriterAt, key string, c chan bool, ctx *fasthttp.RequestCtx) {
+	_, err := downloader.Download(buffer, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})
+	if err != nil {
+		handleError(ctx, err)
+		return
+	}
+
 	c <- true
 }
 
-func resizeImage(file io.Reader, buffer chan io.Reader) {
-	img, format, err := image.Decode(file)
+func resizeImage(file io.Reader, buffer chan io.Reader, ctx *fasthttp.RequestCtx) {
+	img, _, err := image.Decode(file)
 	if err != nil {
-		log.Fatal(err)
+		handleError(ctx, err)
 	}
 
-	fmt.Println(format)
 	b := bytes.NewBuffer([]byte(""))
 	m := resize.Thumbnail(200, 200, img, resize.Lanczos3)
 	jpeg.Encode(b, m, nil)
@@ -105,7 +127,8 @@ func resizeImage(file io.Reader, buffer chan io.Reader) {
 
 func handleError(ctx *fasthttp.RequestCtx, err error) {
 	res := response{false, err.Error()}
-
+	ctx.SetContentType("application/json")
+	ctx.SetStatusCode(fasthttp.StatusInternalServerError)
 	jsonErr := json.NewEncoder(ctx).Encode(res)
 	if jsonErr != nil {
 		log.Fatal("Couldn't marshal json ", jsonErr)
