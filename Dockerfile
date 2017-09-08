@@ -11,5 +11,5 @@ RUN go build
 
 EXPOSE 3001
 
-CMD ["go", "run"]
+CMD ["./resize-server"]
 
